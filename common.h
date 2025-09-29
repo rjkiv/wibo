@@ -1,13 +1,19 @@
+#pragma once
+
 #include <cassert>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <memory>
+#include <optional>
 #include <string>
+#include <unordered_map>
+#include <utility>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <vector>
-#include <memory>
 
 // On Windows, the incoming stack is aligned to a 4 byte boundary.
 // force_align_arg_pointer will realign the stack to match GCC's 16 byte alignment.
@@ -20,6 +26,7 @@ typedef void *HMODULE;
 typedef void *PVOID;
 typedef void *LPVOID;
 typedef void *FARPROC;
+typedef uint16_t WORD;
 typedef uint32_t DWORD;
 typedef DWORD *PDWORD;
 typedef DWORD *LPDWORD;
@@ -57,8 +64,16 @@ typedef unsigned char BYTE;
 #define ERROR_INVALID_PARAMETER 87
 #define ERROR_BUFFER_OVERFLOW 111
 #define ERROR_INSUFFICIENT_BUFFER 122
+#define ERROR_NONE_MAPPED 1332
+#define ERROR_RESOURCE_DATA_NOT_FOUND 1812
+#define ERROR_RESOURCE_TYPE_NOT_FOUND 1813
+#define ERROR_RESOURCE_NAME_NOT_FOUND 1814
+#define ERROR_RESOURCE_LANG_NOT_FOUND 1815
+#define ERROR_MOD_NOT_FOUND 126
 #define ERROR_NEGATIVE_SEEK 131
+#define ERROR_BAD_EXE_FORMAT 193
 #define ERROR_ALREADY_EXISTS 183
+#define ERROR_NOT_OWNER 288
 
 #define INVALID_SET_FILE_POINTER ((DWORD)-1)
 #define INVALID_HANDLE_VALUE ((HANDLE)-1)
@@ -66,6 +81,8 @@ typedef unsigned char BYTE;
 typedef int NTSTATUS;
 #define STATUS_SUCCESS ((NTSTATUS)0x00000000)
 #define STATUS_INVALID_HANDLE ((NTSTATUS)0xC0000008)
+#define STATUS_INVALID_PARAMETER ((NTSTATUS)0xC000000D)
+#define STATUS_NOT_IMPLEMENTED ((NTSTATUS)0xC0000002)
 #define STATUS_END_OF_FILE ((NTSTATUS)0xC0000011)
 #define STATUS_NOT_SUPPORTED ((NTSTATUS)0xC00000BB)
 #define STATUS_UNEXPECTED_IO_ERROR ((NTSTATUS)0xC00000E9)
@@ -84,6 +101,7 @@ namespace wibo {
 	extern std::vector<uint16_t> commandLineW;
 	extern bool debugEnabled;
 	extern unsigned int debugIndent;
+	extern uint16_t tibSelector;
 
 	void debug_log(const char *fmt, ...);
 
@@ -94,12 +112,58 @@ namespace wibo {
 		ResolveByName byName;
 		ResolveByOrdinal byOrdinal;
 	};
-	extern const Module *modules[];
+	struct ModuleInfo;
+	void initializeModuleRegistry();
+	void shutdownModuleRegistry();
+	ModuleInfo *moduleInfoFromHandle(HMODULE module);
+	void setDllDirectoryOverride(const std::filesystem::path &path);
+	void clearDllDirectoryOverride();
+	std::optional<std::filesystem::path> dllDirectoryOverride();
+	HMODULE findLoadedModule(const char *name);
+	void registerOnExitTable(void *table);
+	void addOnExitFunction(void *table, void (*func)());
+	void executeOnExitTable(void *table);
+	void runPendingOnExit(ModuleInfo &info);
 
 	HMODULE loadModule(const char *name);
 	void freeModule(HMODULE module);
 	void *resolveFuncByName(HMODULE module, const char *funcName);
 	void *resolveFuncByOrdinal(HMODULE module, uint16_t ordinal);
+	void *resolveMissingImportByName(const char *dllName, const char *funcName);
+	void *resolveMissingImportByOrdinal(const char *dllName, uint16_t ordinal);
+
+	struct ResourceIdentifier {
+		ResourceIdentifier() : isString(false), id(0) {}
+		static ResourceIdentifier fromID(uint32_t value) {
+			ResourceIdentifier ident;
+			ident.isString = false;
+			ident.id = value;
+			return ident;
+		}
+		static ResourceIdentifier fromString(std::u16string value) {
+			ResourceIdentifier ident;
+			ident.isString = true;
+			ident.name = std::move(value);
+			return ident;
+		}
+		bool isString;
+		uint32_t id;
+		std::u16string name;
+	};
+
+	struct ResourceLocation {
+		const void *dataEntry = nullptr;
+		const void *data = nullptr;
+		uint32_t size = 0;
+		uint16_t language = 0;
+	};
+
+	struct ImageResourceDataEntry {
+		uint32_t offsetToData;
+		uint32_t size;
+		uint32_t codePage;
+		uint32_t reserved;
+	};
 
 	struct Executable {
 		Executable();
@@ -110,21 +174,48 @@ namespace wibo {
 		size_t imageSize;
 		void *entryPoint;
 		void *rsrcBase;
+		uint32_t rsrcSize;
+		uintptr_t preferredImageBase;
+		intptr_t relocationDelta;
+		uint32_t exportDirectoryRVA;
+		uint32_t exportDirectorySize;
+		uint32_t relocationDirectoryRVA;
+		uint32_t relocationDirectorySize;
+
+		bool findResource(const ResourceIdentifier &type,
+					 const ResourceIdentifier &name,
+					 std::optional<uint16_t> language,
+					 ResourceLocation &out) const;
 
 		template <typename T>
-		T *fromRVA(uint32_t rva) {
+		T *fromRVA(uint32_t rva) const {
 			return (T *) (rva + (uint8_t *) imageBuffer);
 		}
 
 		template <typename T>
-		T *fromRVA(T *rva) {
+		T *fromRVA(T *rva) const {
 			return fromRVA<T>((uint32_t) rva);
 		}
 	};
 	struct ModuleInfo {
-		std::string name;
-		const wibo::Module* module = nullptr;
+		std::string originalName;
+		std::string normalizedName;
+		std::filesystem::path resolvedPath;
+		const wibo::Module *module = nullptr;
 		std::unique_ptr<wibo::Executable> executable;
+		void *entryPoint = nullptr;
+		void *imageBase = nullptr;
+		size_t imageSize = 0;
+		unsigned int refCount = 0;
+		bool dataFile = false;
+		bool processAttachCalled = false;
+		bool processAttachSucceeded = false;
+		bool dontResolveReferences = false;
+		uint32_t exportOrdinalBase = 0;
+		std::vector<void *> exportsByOrdinal;
+		std::unordered_map<std::string, uint16_t> exportNameToOrdinal;
+		bool exportsInitialized = false;
+		std::vector<void *> onExitFunctions;
 	};
 
 	extern Executable *mainModule;

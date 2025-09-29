@@ -1,15 +1,17 @@
 #include "common.h"
 #include "files.h"
+#include "strutil.h"
 #include <asm/ldt.h>
+#include <charconv>
+#include <cstring>
+#include <fcntl.h>
 #include <filesystem>
 #include <memory>
-#include "strutil.h"
+#include <stdarg.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
-#include <stdarg.h>
+#include <unistd.h>
 #include <vector>
-#include <charconv>
-#include <fcntl.h>
 
 uint32_t wibo::lastError = 0;
 char** wibo::argv;
@@ -20,6 +22,7 @@ std::vector<uint16_t> wibo::commandLineW;
 wibo::Executable *wibo::mainModule = 0;
 bool wibo::debugEnabled = false;
 unsigned int wibo::debugIndent = 0;
+uint16_t wibo::tibSelector = 0;
 
 void wibo::debug_log(const char *fmt, ...) {
 	va_list args;
@@ -32,145 +35,6 @@ void wibo::debug_log(const char *fmt, ...) {
 	}
 
 	va_end(args);
-}
-
-#define FOR_256_3(a, b, c, d) FOR_ITER((a << 6 | b << 4 | c << 2 | d))
-#define FOR_256_2(a, b) \
-	FOR_256_3(a, b, 0, 0) FOR_256_3(a, b, 0, 1) FOR_256_3(a, b, 0, 2) FOR_256_3(a, b, 0, 3) \
-	FOR_256_3(a, b, 1, 0) FOR_256_3(a, b, 1, 1) FOR_256_3(a, b, 1, 2) FOR_256_3(a, b, 1, 3) \
-	FOR_256_3(a, b, 2, 0) FOR_256_3(a, b, 2, 1) FOR_256_3(a, b, 2, 2) FOR_256_3(a, b, 2, 3) \
-	FOR_256_3(a, b, 3, 0) FOR_256_3(a, b, 3, 1) FOR_256_3(a, b, 3, 2) FOR_256_3(a, b, 3, 3)
-#define FOR_256 \
-	FOR_256_2(0, 0) FOR_256_2(0, 1) FOR_256_2(0, 2) FOR_256_2(0, 3) \
-	FOR_256_2(1, 0) FOR_256_2(1, 1) FOR_256_2(1, 2) FOR_256_2(1, 3) \
-	FOR_256_2(2, 0) FOR_256_2(2, 1) FOR_256_2(2, 2) FOR_256_2(2, 3) \
-	FOR_256_2(3, 0) FOR_256_2(3, 1) FOR_256_2(3, 2) FOR_256_2(3, 3) \
-
-static int stubIndex = 0;
-static char stubDlls[0x100][0x100];
-static char stubFuncNames[0x100][0x100];
-
-static void stubBase(int index) {
-	printf("Unhandled function %s (%s)\n", stubFuncNames[index], stubDlls[index]);
-	exit(1);
-}
-
-void (*stubFuncs[0x100])(void) = {
-#define FOR_ITER(i) []() { stubBase(i); },
-FOR_256
-#undef FOR_ITER
-};
-
-#undef FOR_256_3
-#undef FOR_256_2
-#undef FOR_256
-
-static void *resolveMissingFuncName(const char *dllName, const char *funcName) {
-	DEBUG_LOG("Missing function: %s (%s)\n", dllName, funcName);
-	assert(stubIndex < 0x100);
-	assert(strlen(dllName) < 0x100);
-	assert(strlen(funcName) < 0x100);
-	strcpy(stubFuncNames[stubIndex], funcName);
-	strcpy(stubDlls[stubIndex], dllName);
-	return (void *)stubFuncs[stubIndex++];
-}
-
-static void *resolveMissingFuncOrdinal(const char *dllName, uint16_t ordinal) {
-	char buf[16];
-	sprintf(buf, "%d", ordinal);
-	return resolveMissingFuncName(dllName, buf);
-}
-
-extern const wibo::Module lib_advapi32;
-extern const wibo::Module lib_bcrypt;
-extern const wibo::Module lib_crt;
-extern const wibo::Module lib_kernel32;
-extern const wibo::Module lib_lmgr;
-extern const wibo::Module lib_mscoree;
-extern const wibo::Module lib_msvcrt;
-extern const wibo::Module lib_ntdll;
-extern const wibo::Module lib_ole32;
-extern const wibo::Module lib_user32;
-extern const wibo::Module lib_vcruntime;
-extern const wibo::Module lib_version;
-const wibo::Module * wibo::modules[] = {
-	&lib_advapi32,
-	&lib_bcrypt,
-	&lib_crt,
-	&lib_kernel32,
-	&lib_lmgr,
-	&lib_mscoree,
-	&lib_msvcrt,
-	&lib_ntdll,
-	&lib_ole32,
-	&lib_user32,
-	&lib_vcruntime,
-	&lib_version,
-	nullptr,
-};
-
-HMODULE wibo::loadModule(const char *dllName) {
-	auto *result = new ModuleInfo;
-	result->name = dllName;
-	for (int i = 0; modules[i]; i++) {
-		for (int j = 0; modules[i]->names[j]; j++) {
-			if (strcasecmp(dllName, modules[i]->names[j]) == 0) {
-				result->module = modules[i];
-				return result;
-			}
-		}
-	}
-	return result;
-}
-
-void wibo::freeModule(HMODULE module) { delete static_cast<ModuleInfo *>(module); }
-
-void *wibo::resolveFuncByName(HMODULE module, const char *funcName) {
-	auto *info = static_cast<ModuleInfo *>(module);
-	assert(info);
-	if (info->module && info->module->byName) {
-		void *func = info->module->byName(funcName);
-		if (func)
-			return func;
-	}
-	return resolveMissingFuncName(info->name.c_str(), funcName);
-}
-
-void *wibo::resolveFuncByOrdinal(HMODULE module, uint16_t ordinal) {
-	auto *info = static_cast<ModuleInfo *>(module);
-	assert(info);
-	if (info->module && info->module->byOrdinal) {
-		void *func = info->module->byOrdinal(ordinal);
-		if (func)
-			return func;
-	}
-	return resolveMissingFuncOrdinal(info->name.c_str(), ordinal);
-}
-
-wibo::Executable *wibo::executableFromModule(HMODULE module) {
-	if (wibo::isMainModule(module)) {
-		return wibo::mainModule;
-	}
-
-	auto info = static_cast<wibo::ModuleInfo *>(module);
-	if (!info->executable) {
-		DEBUG_LOG("wibo::executableFromModule: loading %s\n", info->name.c_str());
-		auto executable = std::make_unique<wibo::Executable>();
-		const auto path = files::pathFromWindows(info->name.c_str());
-		FILE *f = fopen(path.c_str(), "rb");
-		if (!f) {
-			perror("wibo::executableFromModule");
-			return nullptr;
-		}
-		bool result = executable->loadPE(f, false);
-		fclose(f);
-		if (!result) {
-			DEBUG_LOG("wibo::executableFromModule: failed to load %s\n", path.c_str());
-			return nullptr;
-		}
-		info->executable = std::move(executable);
-	}
-	return info->executable.get();
 }
 
 struct UNICODE_STRING {
@@ -221,6 +85,18 @@ struct TIB {
 TIB tib;
 
 const size_t MAPS_BUFFER_SIZE = 0x10000;
+
+static void printHelp(const char *argv0) {
+	std::filesystem::path exePath(argv0 ? argv0 : "wibo");
+	std::string exeName = exePath.filename().string();
+	fprintf(stdout, "Usage: %s [options] <program.exe> [arguments...]\n", exeName.c_str());
+	fprintf(stdout, "\n");
+	fprintf(stdout, "Options:\n");
+	fprintf(stdout, "  --help\t\tShow this help message and exit\n");
+	fprintf(stdout, "  -C, --chdir DIR\tChange working directory before launching the program\n");
+	fprintf(stdout, "  -D, --debug\tEnable shim debug logging (same as WIBO_DEBUG=1)\n");
+	fprintf(stdout, "  --\t\tStop option parsing; following arguments are interpreted as the program command line\n");
+}
 
 /**
  * Read /proc/self/maps into a buffer.
@@ -324,17 +200,73 @@ static void blockUpper2GB() {
 }
 
 int main(int argc, char **argv) {
-	if (argc <= 1) {
-		printf("Usage: ./wibo program.exe ...\n");
-		return 1;
+	std::string chdirPath;
+	bool optionDebug = false;
+	bool parsingOptions = true;
+	int programIndex = -1;
+
+	for (int i = 1; i < argc; ++i) {
+		const char *arg = argv[i];
+		if (parsingOptions) {
+			if (strcmp(arg, "--") == 0) {
+				parsingOptions = false;
+				continue;
+			}
+			if (strcmp(arg, "--help") == 0) {
+				printHelp(argv[0]);
+				return 0;
+			}
+			if (strcmp(arg, "-D") == 0 || strcmp(arg, "--debug") == 0) {
+				optionDebug = true;
+				continue;
+			}
+			if (strncmp(arg, "--chdir=", 8) == 0) {
+				chdirPath = arg + 8;
+				continue;
+			}
+			if (strcmp(arg, "-C") == 0 || strcmp(arg, "--chdir") == 0) {
+				if (i + 1 >= argc) {
+					fprintf(stderr, "Option %s requires a directory argument\n", arg);
+					return 1;
+				}
+				chdirPath = argv[++i];
+				continue;
+			}
+			if (strncmp(arg, "-C", 2) == 0 && arg[2] != '\0') {
+				chdirPath = arg + 2;
+				continue;
+			}
+			if (arg[0] == '-' && arg[1] != '\0') {
+				fprintf(stderr, "Unknown option: %s\n", arg);
+				fprintf(stderr, "\n");
+				printHelp(argv[0]);
+				return 1;
+			}
+		}
+
+		programIndex = i;
+		break;
 	}
 
-	if (getenv("WIBO_DEBUG")) {
+	if (programIndex == -1) {
+		printHelp(argv[0]);
+		return argc <= 1 ? 0 : 1;
+	}
+
+	if (!chdirPath.empty()) {
+		if (chdir(chdirPath.c_str()) != 0) {
+			std::string message = std::string("Failed to chdir to ") + chdirPath;
+			perror(message.c_str());
+			return 1;
+		}
+	}
+
+	if (optionDebug || getenv("WIBO_DEBUG")) {
 		wibo::debugEnabled = true;
 	}
 
-	if (getenv("WIBO_DEBUG_INDENT")) {
-		wibo::debugIndent = std::stoul(getenv("WIBO_DEBUG_INDENT"));
+	if (const char *debugIndentEnv = getenv("WIBO_DEBUG_INDENT")) {
+		wibo::debugIndent = std::stoul(debugIndentEnv);
 	}
 
 	blockUpper2GB();
@@ -362,15 +294,20 @@ int main(int argc, char **argv) {
 		return 1;
 	}
 
+	wibo::tibSelector = static_cast<uint16_t>((tibDesc.entry_number << 3) | 7);
+
+	char **guestArgv = argv + programIndex;
+	int guestArgc = argc - programIndex;
+
 	// Build a command line
 	std::string cmdLine;
-	for (int i = 1; i < argc; i++) {
+	for (int i = 0; i < guestArgc; ++i) {
 		std::string arg;
-		if (i == 1) {
-			arg = files::pathToWindows(std::filesystem::absolute(argv[1]));
+		if (i == 0) {
+			arg = files::pathToWindows(std::filesystem::absolute(guestArgv[0]));
 		} else {
 			cmdLine += ' ';
-			arg = argv[i];
+			arg = guestArgv[i];
 		}
 		bool needQuotes = arg.find_first_of("\\\" \t\n") != std::string::npos;
 		if (needQuotes)
@@ -407,13 +344,15 @@ int main(int argc, char **argv) {
 	DEBUG_LOG("Command line: %s\n", wibo::commandLine);
 
 	wibo::executableName = argv[0];
-	wibo::argv = argv + 1;
-	wibo::argc = argc - 1;
+	wibo::argv = guestArgv;
+	wibo::argc = guestArgc;
+
+	wibo::initializeModuleRegistry();
 
 	wibo::Executable exec;
 	wibo::mainModule = &exec;
 
-	char* pe_path = argv[1];
+	char* pe_path = guestArgv[0];
 	FILE *f = fopen(pe_path, "rb");
 	if (!f) {
 		std::string mesg = std::string("Failed to open file ") + pe_path;
@@ -424,14 +363,14 @@ int main(int argc, char **argv) {
 	exec.loadPE(f, true);
 	fclose(f);
 
-	uint16_t tibSegment = (tibDesc.entry_number << 3) | 7;
 	// Invoke the damn thing
 	asm(
 		"movw %0, %%fs; call *%1"
 		:
-		: "r"(tibSegment), "r"(exec.entryPoint)
+		: "r"(wibo::tibSelector), "r"(exec.entryPoint)
 	);
 	DEBUG_LOG("We came back\n");
+	wibo::shutdownModuleRegistry();
 
 	return 1;
 }

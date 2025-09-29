@@ -1,17 +1,23 @@
 # Build stage
-FROM --platform=linux/i386 alpine:latest AS build
+FROM ubuntu:24.04 AS build
 
 # Install dependencies
-RUN apk add --no-cache \
-    bash \
-    cmake \
-    ninja \
-    g++ \
-    linux-headers \
-    binutils \
-    git \
-    mingw-w64-binutils \
-    mingw-w64-gcc
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        binutils \
+        binutils-mingw-w64-i686 \
+        ca-certificates \
+        cmake \
+        file \
+        g++-multilib \
+        gcc-mingw-w64-i686 \
+        gdb \
+        git \
+        ninja-build \
+        unzip \
+        wget \
+    && rm -rf /var/lib/apt/lists/*
 
 # Copy source files
 WORKDIR /wibo
@@ -20,20 +26,18 @@ COPY . /wibo
 # Build type (Release, Debug, RelWithDebInfo, MinSizeRel)
 ARG build_type=Release
 
-# Build static binary
 RUN cmake -S /wibo -B /wibo/build -G Ninja \
         -DCMAKE_BUILD_TYPE="$build_type" \
-        -DCMAKE_CXX_FLAGS="-static" \
         -DBUILD_TESTING=ON \
         -DWIBO_ENABLE_FIXTURE_TESTS=ON \
     && cmake --build /wibo/build \
     && ( [ "$build_type" != "Release" ] || strip -g /wibo/build/wibo )
 
-# Export binary (usage: docker build --target export --output build .)
+# Export binary (usage: docker build -f Dockerfile.ubuntu --target export --output dist .)
 FROM scratch AS export
 COPY --from=build /wibo/build/wibo .
 
 # Runnable container
-FROM alpine:latest
+FROM ubuntu:24.04
 COPY --from=build /wibo/build/wibo /usr/local/sbin/wibo
-CMD /usr/local/sbin/wibo
+CMD ["/usr/local/sbin/wibo"]
